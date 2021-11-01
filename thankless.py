@@ -107,7 +107,9 @@ class SimpleState(GameState):
         if self.last_card == game.card:
             # only thing that could have changed is player.chips and game.chips
             self.state[0] -= 1 
-            self.state[1] += game.number_of_players
+            # card-chips cannot be negative because we hard coded
+            # that a player will take a card if card==chips
+            self.state[1] -= game.number_of_players
         else:
             # Only update distances if we haven't yet for this new card
             self.last_card = game.card
@@ -119,7 +121,7 @@ class SimpleState(GameState):
             o_dist = np.min([SimpleState.min_distance(p, game.card)
                              for p in game.players if p is not player])
 
-            self.state=np.array([player.chips, game.chips, game.card, 
+            self.state=np.array([player.chips, game.card-game.chips, 
                                  p_dist, o_dist])
         
 class FullState(GameState):
@@ -307,19 +309,16 @@ class HeuristicAgent(Computer):
     
     def prob_state(x, state_index):
         """Probability of taking the card based on the state variable"""
-        # [player.chips, game.chips, game.card, p_dist, o_dist])
+        # [player.chips, game.card-game.chips, p_dist, o_dist])
         
         # player chips
         if state_index == 0:
             return 1-sigmoid(x, 4, .8)
-        # card chips
+        # card-chips
         elif state_index == 1:
-            return sigmoid(x, 10, 0.6)
-        # card value
-        elif state_index == 2:
-            return 1-sigmoid(x, 18, 0.25)
+            return 1-sigmoid(x, 17, 0.35)
         # player/opponent distance
-        elif state_index > 2:
+        elif state_index > 1:
             return 1-sigmoid(x, 2, 2)
         
     def p_take_card(state):
