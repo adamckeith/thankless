@@ -2,9 +2,10 @@ import numpy as np
 import itertools
 import random 
 import copy
+import time
 
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Activation
+from tensorflow.keras.layers import InputLayer, Dense, Activation
 from tensorflow.keras.optimizers import Adam
 import keras
 
@@ -20,7 +21,7 @@ class Thankless(object):
         # ## Creating the model
         self.model = Sequential()
         self.model.add(Dense(16,input_dim=Player.state_size,activation='relu'))
-        self.model.add(Dense(8,activation='relu'))
+        # self.model.add(Dense(8,activation='relu'))
         self.model.add(Dense(1, activation='softmax'))
         self.model.compile(optimizer='adam',loss='binary_crossentropy')
 
@@ -99,7 +100,10 @@ class SimpleState(GameState):
                 if np.count_nonzero(diffs == distance) == 2:
                     distance = 0
         else:
-            distance = np.nan
+            # distance = np.nan
+            # use a distance that gives ~10% chance of taking card so not to
+            # skew consensus pick early in the game
+            distance = 3
             
         return distance
         
@@ -162,7 +166,7 @@ class NoThanks(object):
     cards_removed = 9 # number of cards never revealed
     #cards_removed = 2 # number of cards never revealed
     # select this number of cards out of starting_deck
-    deck_size = full_deck_size-cards_removed 
+
     
     def __init__(self, players, silent=False):
         self.number_of_players = len(players)
@@ -174,7 +178,9 @@ class NoThanks(object):
 
     def reset(self):
         """Reset game values with the same players"""
+        self.done = False
         self.chips = 0
+        self.deck_size = NoThanks.full_deck_size-NoThanks.cards_removed 
         self.shuffle_deck()
 
         for p in self.players:
@@ -186,28 +192,33 @@ class NoThanks(object):
     def shuffle_deck(self):
         """Create game deck by shuffling and leaving out 9 cards"""
         self.deck = iter(np.random.choice(NoThanks.starting_deck,
-                                          NoThanks.deck_size, 
+                                          self.deck_size, 
                                           replace = False))
     def draw_card(self):
         self.card = next(self.deck)
+        self.deck_size -= 1
         self.chips = 0
         
     def player_turn(self):
         return self.player.action(self)
                 
     def game_over(self):
+        self.done = True
         scores = self.get_scores()
         self.winner = np.argmax(scores) #this breaks ties for us??
         
         if not self.silent:
             print("Player " + str(self.winner+1) + " wins")
-            print("Mean Score " + str(np.mean(scores)))
+            print("Scores : " + str(scores))
         
     def next_player(self):
         self.player = next(self.player_cycle)
+        return self.player
 
     def play(self):
         """Play the game until the deck runs out"""
+        if self.done:
+            raise StopIteration()
         self.draw_card()
         while True:
             # If player took a card, still their turn
@@ -236,23 +247,27 @@ class Player(object):
         self.position = position
         self.chips = NoThanks.starting_chips
         self.cards = []
-        self.score = 0       
+        self.score = self.chips  
+        self.reward = 0
         
     def pass_turn(self):
-        """Pass turn by placing a chip on the card, returns 0"""
-        self.chips -= 1;
-        return 0
+        """1 = Pass turn by placing a chip on the card. Returns reward = -1"""
+        self.chips -= 1
+        self.score -= 1
+        return -1 
     
     def take_card(self, game):
-        """Add card to player.cards, and add card chips to player chips"""
-        self.cards.append(game.card)
-        self.cards.sort()
+        """0 = Add card to player.cards, and add card chips to player chips"""
+        old_score = self.score
         self.chips += game.chips
-        return 1
+        self.cards.append(game.card)
+        # self.cards.sort()
+        
+        return self.calculate_score()-old_score
     
-    # sublcasses should implement choose_action        
+    # sublcasses must implement choose_action       
     def choose_action(self, game):
-        pass
+        raise NotImplementedError()
         
     def action(self, game):
         """Game asks player to act. Returns 1 if card is taken, 0 if passed"""
@@ -260,43 +275,56 @@ class Player(object):
         # Must take if no chips or if chips on card equals card value 
         # (why wouldn't you?)
         if self.chips<=0 or game.chips>=game.card:
-            action = self.take_card(game)
+            self.reward = self.take_card(game)
+            a = 1
         else:
-            action = self.choose_action(game)
-            if action:
-                self.take_card(game)
+            a = self.choose_action(game)
+            if a:
+                self.reward = self.take_card(game)
             else:
-                self.pass_turn()
+                self.reward = self.pass_turn()
         
-        # Calculate score after each action, #TODO kinda slow
-        self.calculate_score()
-        return action
+        return a
         
     def calculate_score(self):
         """Calculate current score for this player"""
+        # TODO optimize this?
         self.score = self.chips - sum([c for c in self.cards 
                                        if c-1 not in self.cards])
+        return self.score
         
 class Human(Player):
     """Human player via terminal input"""
-    def choose_action(self):
-        # TODO terminal input
-        pass
+    def choose_action(self, game):
+        print("=====================================")
+        print("Card: " + str(game.card) + " | Chips: " + str(game.chips) + 
+              " | # Cards Left: " + str(game.deck_size))
+        print("=====================================")
+        self.cards.sort()
+        print("My Cards: " + str(self.cards) + " My Chips: " + str(self.chips))
+        
+        # wrap around all players back to ourself to print out their cards
+        while game.next_player() is not self:
+            game.player.sort()
+            print("Player " + str(game.player.position) + "'s cards: " + str(game.player.cards))    
+        
+        return int(input("0 = Pass, 1 = Take Card: "))
+        
 
 class Computer(Player):
     """Generic automated player"""
-    def choose_action(self, game):
-        # assign a probability for flipping a coin
-        # return np.random.binomial(1, 0.10)
-        pass
 
-        
+    @staticmethod
+    def flip_coin(p):
+        """Computer players flip a biased coin to choose action"""
+        return np.random.binomial(1, p)
+
 
 class RandomAgent(Computer):
     """Random player that chooses action based on fixed probabilities"""
-    
+    p_take_card = 0.10
     def choose_action(self, game):
-        return np.random.binomial(1, 0.10)
+        return self.flip_coin(RandomAgent.p_take_card)
 
 class HeuristicAgent(Computer):
     """Agent that uses some heuristics to make decisions"""
@@ -315,7 +343,7 @@ class HeuristicAgent(Computer):
         
         # player chips
         if state_index == 0:
-            return 1-sigmoid(x, 4, .8)
+            return 1-sigmoid(x, 6, .6)
         # card chips
         elif state_index == 1:
             return sigmoid(x, 10, 0.6)
@@ -327,54 +355,83 @@ class HeuristicAgent(Computer):
             return 1-sigmoid(x, 2, 2)
         
     def p_take_card(state):
-        # TODO maybe odist should only be relevant if we are worried about an
-        # opponent taking a good card for us from us (compare distances)        
+        """Return 0, p, or 1 based on consensus of coin flips for 
+        various state variables"""
         
         parray = np.array([HeuristicAgent.prob_state(value, i) 
                            for i, value in enumerate(state)])
-            
-        #return np.mean(parray[~np.isnan(parray)])
-        take_or_pass = np.random.binomial(1, parray[~np.isnan(parray)])
-        _, counts = np.unique(take_or_pass, return_counts=True)
-        # if equal heads and tails return p=0.5 otherwise return 1 or 0
-        if np.all(counts == counts[0]):
-            # no consensus err on the side of not taking the card
-            return 0.1
-        else:
-            # assumes _ for counts is always in order (0 then 1)
-            return np.argmax(counts)        
         
-    def choose_action(self, game):
-        # Calculate the probability of taking a card by averaging over
-        # the probabilities of taking a card for each simple state variable
+        # Flip a biased coin for each probability associated with each
+        # state variable
+        state_flips = np.random.binomial(1, parray[~np.isnan(parray)])
+        # gives 0, 0.5, or 1 based on consensus
+        consensus = np.median(state_flips)
         
+        # no consensus err on the side of not taking the card by dropping the 
+        # probability
+        if np.isclose(consensus, 0.5):
+            consensus = RandomAgent.p_take_card
+        return consensus
+        
+    def choose_action(self, game):        
         # each simple state variable corresponds to a weighted coin
         # with each coin being a function of the state variable
         self.state.update_state(self, game)
 
-        p_take_card = HeuristicAgent.p_take_card(self.state.state)
+        p = HeuristicAgent.p_take_card(self.state.state)
 
-        action = np.random.binomial(1, p_take_card)
-        return action 
+        return self.flip_coin(p)
+        
     
 class LearningAgent(Computer):
-    # state_size = NoThanks.full_deck_size+3
-            # First update the state. We will add the action chosen after
-        # self.update_state(game)
-    #         self.history = []
-    # def update_history(self):
-    #     self.history.append(self.player_state)
-        # Add the action chosen to the previous state and update the history
-        # self.player_state = np.insert(self.player_state, 0, action)
-        # self.update_history()
-    pass
+    
+    def __init__(self, position):        
+        self.state = SimpleState()
+        super().__init__(position)
+        
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        
+        
+        self.model = Sequential()
+        self.model.add(InputLayer(batch_input_shape=(1, 5)))
+        self.model.add(Dense(16,activation='relu'))
+        self.model.add(Dense(1, activation='sigmoid'))
+        self.model.compile(optimizer='adam', loss='mse')
+        
+    def reset(self, position):
+        super().reset(position)
+        self.state.reset()
+
+    def choose_action(self, game):
+        self.state.update_state(self, game) 
+        self.states.append(self.state.state)
+       
+        # TODO call HeuristicAgent choose_action for better training?
+        p = self.model.predict(self.state.state.reshape(1,5))[0]
+        min_p = 1e-5
+        max_p = 1 - min_p
+        p_new = np.clip(p, min_p, max_p)
+        return self.flip_coin(p_new)
+    
+    def action(self, game):
+        a = super().action(game)
+        self.actions.append(a)
+        self.rewards.append(self.reward)
+        return a
+
+    def train(self):
+        states = np.asarray(self.states)
+        state_len = len(states)
+        target_vectors = np.zeros((state_len, 2))
+        for i in range(state_len):
+            target_vectors[i][self.actions[i]] = self.rewards[i]
+        
+        self.model.fit(x=states, y=target_vectors)
 
 def main():
     pass
-    # game = NoThanks(4, 0)
-    # game.play()
-    # scores = game.get_scores()
-    # print(scores)
     
 
 if __name__ == "__main__":
