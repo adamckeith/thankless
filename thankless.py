@@ -1,5 +1,6 @@
 import numpy as np
 import itertools
+from collections import deque 
 import random 
 import copy
 import time
@@ -43,9 +44,9 @@ class NoThanksController(object):
     #     self.players = [Computer(i) for i in range(number_of_computers)] + \
     #                    [Human(i+number_of_computers) for i in range(number_of_humans)]
     
-    def play_games(self, players, number_of_games):
+    def play_games(self, players, number_of_games, silent=True):
         score_history = []
-        game = NoThanks(players, silent=True)
+        game = NoThanks(players, silent=silent)
         for i in range(number_of_games):
             game.reset()
             game.play()
@@ -74,11 +75,15 @@ class SimpleState(GameState):
     # number of players, current player chips, chips on card,
     # value of face up card, min card distance between players cards, and 
     # min card distance across all players
+    
+    shape = (1,5)
+    
     def __init__(self):
         self.reset()
         
     def reset(self):
         self.state = []
+        self.shape = SimpleState.shape
         self.last_card = np.nan
         
     def min_distance(player, card):
@@ -125,6 +130,7 @@ class SimpleState(GameState):
 
             self.state=np.array([player.chips, game.chips, game.card, 
                                  p_dist, o_dist])
+        return self.state
         
 class FullState(GameState):
      """Full model that an agent uses for representing the game state"""
@@ -205,6 +211,9 @@ class NoThanks(object):
     def game_over(self):
         self.done = True
         scores = self.get_scores()
+        # Do any post game over work in players
+        for p in self.players:
+            p.game_over(self)
         self.winner = np.argmax(scores) #this breaks ties for us??
         
         if not self.silent:
@@ -268,6 +277,9 @@ class Player(object):
     # sublcasses must implement choose_action       
     def choose_action(self, game):
         raise NotImplementedError()
+    
+    def game_over(self, game):
+        pass
         
     def action(self, game):
         """Game asks player to act. Returns 1 if card is taken, 0 if passed"""
@@ -283,7 +295,7 @@ class Player(object):
                 self.reward = self.take_card(game)
             else:
                 self.reward = self.pass_turn()
-        
+        self.reward += 1 # try making everything positive
         return a
         
     def calculate_score(self):
@@ -319,6 +331,10 @@ class Computer(Player):
         """Computer players flip a biased coin to choose action"""
         return np.random.binomial(1, p)
 
+class PasserAgent(Computer):
+    """Player that always chooses to pass unless forced"""
+    def choose_action(self, game):
+        return 0
 
 class RandomAgent(Computer):
     """Random player that chooses action based on fixed probabilities"""
@@ -354,7 +370,7 @@ class HeuristicAgent(Computer):
         elif state_index > 2:
             return 1-sigmoid(x, 2, 2)
         
-    def p_take_card(state):
+    def heuristic_prob(state):
         """Return 0, p, or 1 based on consensus of coin flips for 
         various state variables"""
         
@@ -378,57 +394,103 @@ class HeuristicAgent(Computer):
         # with each coin being a function of the state variable
         self.state.update_state(self, game)
 
-        p = HeuristicAgent.p_take_card(self.state.state)
+        p = HeuristicAgent.heuristic_prob(self.state.state)
 
         return self.flip_coin(p)
         
     
 class LearningAgent(Computer):
     
+    gamma              = 0.95
+    exploration_rate   = 1.0
+    exploration_min    = 0.01
+    exploration_decay  = 0.995
+    
     def __init__(self, position):        
         self.state = SimpleState()
+        self.memory = deque(maxlen=1000)
+        self.set_eps(LearningAgent.exploration_rate)
+        
         super().__init__(position)
-        
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        
-        
+                
         self.model = Sequential()
-        self.model.add(InputLayer(batch_input_shape=(1, 5)))
-        self.model.add(Dense(16,activation='relu'))
-        self.model.add(Dense(1, activation='sigmoid'))
+        # self.model.add(Dense(16,activation='relu', input_dim=5))
+        self.model.add(Dense(20, activation='relu', input_dim=5))
+        self.model.add(Dense(20, activation='relu'))
+        # self.model.add(Dense(2, activation='sigmoid'))
+        self.model.add(Dense(2, activation='softmax'))
         self.model.compile(optimizer='adam', loss='mse')
         
     def reset(self, position):
         super().reset(position)
+        # Learn from the last game(s)
+        self.replay()
+        self.last_action = None
         self.state.reset()
+        
+    def set_eps(self, eps):
+        if eps < LearningAgent.exploration_min:
+            self.eps = LearningAgent.exploration_min
+        else:
+            self.eps = eps
+            
+    def game_over(self, game):
+        if self.last_action is not None:
+            self.remember(self.state.state, self.last_action, self.reward, None)
 
     def choose_action(self, game):
-        self.state.update_state(self, game) 
-        self.states.append(self.state.state)
-       
-        # TODO call HeuristicAgent choose_action for better training?
-        p = self.model.predict(self.state.state.reshape(1,5))[0]
-        min_p = 1e-5
-        max_p = 1 - min_p
-        p_new = np.clip(p, min_p, max_p)
+        old_state = copy.deepcopy(self.state.state)
+        new_state = copy.deepcopy(self.state.update_state(self, game))
+        
+        if self.last_action is not None:
+            self.remember(old_state, self.last_action, self.reward, new_state)
+
+        # Early in training, use heuristic agent
+        if np.random.random() < self.eps:
+            # p = HeuristicAgent.heuristic_prob(self.state.state)
+            # p_new = p
+            p_new = 0.8 # need to have a high chance of taking cards to get positive rewards sometimes?
+        else:
+            # p = self.model.predict(self.state.state.reshape(1,5))[0][1]
+            p = self.model.predict(self.state.state.reshape(self.state.shape))[0]
+            p_new = np.argmax(p)
+        # min_p = 1e-5
+        # max_p = 1 - min_p
+        # p_new = np.clip(p, min_p, max_p)
         return self.flip_coin(p_new)
     
     def action(self, game):
-        a = super().action(game)
-        self.actions.append(a)
-        self.rewards.append(self.reward)
-        return a
-
-    def train(self):
-        states = np.asarray(self.states)
-        state_len = len(states)
-        target_vectors = np.zeros((state_len, 2))
-        for i in range(state_len):
-            target_vectors[i][self.actions[i]] = self.rewards[i]
+        self.last_action = super().action(game)
+        return self.last_action
+    
+    def remember(self, state, action, reward, next_state):
+        self.memory.append((state, action, reward, next_state))
         
-        self.model.fit(x=states, y=target_vectors)
+    def replay(self, sample_batch_size=32):
+        if len(self.memory) < sample_batch_size:
+            return
+        sample_batch = random.sample(self.memory, sample_batch_size)
+        for state, action, reward, next_state in sample_batch:
+            state = state.reshape(self.state.shape)
+            target = reward
+            if next_state is not None:
+                next_state = next_state.reshape(self.state.shape)
+                target = reward + LearningAgent.gamma * \
+                         np.amax(self.model.predict(next_state)[0])
+            target_f = self.model.predict(state)
+            target_f[0][action] = target
+            self.model.fit(state, target_f, epochs=1, verbose=0)
+        self.set_eps(self.eps*LearningAgent.exploration_decay)
+
+
+    # def train(self):
+    #     states = np.asarray(self.states)
+    #     state_len = len(states)
+    #     target_vectors = np.zeros((state_len, 2))
+    #     for i in range(state_len):
+    #         target_vectors[i][self.actions[i]] = self.rewards[i]
+        
+    #     self.model.fit(x=states, y=target_vectors, epochs = 5)
 
 def main():
     pass
