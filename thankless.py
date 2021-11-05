@@ -348,12 +348,14 @@ class Human(Player):
         return int(input("0 = Pass, 1 = Take Card: "))
     
     def game_over(self, game):
-        print("=========+++FINAL STATE=====================")
+        print("===============FINAL STATE===================")
         self.cards.sort()
         print("My Cards: " + str(self.cards) + " My Chips: " + str(self.chips))
         
         # wrap around all players back to ourself to print out their cards
-        while game.next_player() is not self:
+        for p in game.players:
+            if p is self:
+                continue
             game.player.cards.sort()
             print("Player " + str(game.player.position) + "'s cards: " + str(game.player.cards))    
 
@@ -400,11 +402,13 @@ class HeuristicAgent(RandomAgent):
             return 1-sigmoid(x, 6, .6)
         # card chips
         elif state_index == 1:
-            return sigmoid(x, 10, 0.6)
+            # return sigmoid(x, 10, 0.6)
+            return sigmoid(x, 8, 0.75) # need to pick up cards earlier
         # reward for taking card
         elif state_index == 2:
             # its ok to take small negative rewards?
-            return sigmoid(x, -3, 1)
+            # return sigmoid(x, -3, 1)
+            return sigmoid(x, -5, 1) # need to pick up card earlier
         # card value
         elif state_index == 3:
             return 1-sigmoid(x, 18, 0.25)
@@ -474,7 +478,7 @@ class LearningAgent(Computer):
     gamma              = 0.95
     exploration_rate   = 1.0
     exploration_min    = 0.01
-    exploration_decay  = 0.99
+    exploration_decay  = 0.995
     
     def __init__(self, position):        
         self.state = SimpleState()
@@ -488,8 +492,7 @@ class LearningAgent(Computer):
         self.model.add(Dense(24, activation='relu',
                              input_dim=max(self.state.shape)))
         self.model.add(Dense(24, activation='relu'))
-        # self.model.add(Dense(2, activation='sigmoid'))
-        self.model.add(Dense(2, activation='softmax'))
+        self.model.add(Dense(1, activation='sigmoid'))
         self.model.compile(optimizer='adam', loss='mse')
         
     def reset(self, position):
@@ -511,7 +514,8 @@ class LearningAgent(Computer):
             
     def game_over(self, game):
         if self.is_training and self.last_action is not None:
-            self.remember(self.state.state, self.last_action, self.reward, None)
+            self.remember(copy.deepcopy(self.state.state), 
+                          self.last_action, self.reward, None)
 
     def choose_action(self, game):
         
@@ -530,16 +534,26 @@ class LearningAgent(Computer):
                 # positive rewards are very rare,
                 # and usually the best move is to pass which makes choosing
                 # positive rewards even harder, so help select them when learning
-                p_new = 0.5
+                p = 0.5
             else:
                 # usually a good move to pass
-                p_new = 0.1 
+                p = 0.2
         else:
-            p = self.model.predict(self.state.state.reshape(self.state.shape))[0]
-            p_new = np.argmax(p)
-        # min_p = 1e-5
-        # max_p = 1 - min_p
-        # p_new = np.clip(p, min_p, max_p)
+            p = self.model.predict(self.state.state.reshape(self.state.shape))[0][0]
+        
+        
+        # A uncertainty on our p. As "random" play cools off
+        # start cooling off the uncertainty in our edge probabilities
+        # This might help avoid getting stuck at 0 or 1
+        # Another way to implement exploration
+        if self.eps < 0.5:
+            # never be more than 99% sure of a move
+            min_p = min([0.1*np.exp(-.05/self.eps), 0.01])
+        else:
+            min_p = 0.1
+            
+        max_p = 1 - min_p
+        p_new = np.clip(p, min_p, max_p)
         return self.flip_coin(p_new)
     
     def action(self, game):
@@ -559,10 +573,8 @@ class LearningAgent(Computer):
             if next_state is not None:
                 next_state = next_state.reshape(self.state.shape)
                 target = reward + LearningAgent.gamma * \
-                         np.amax(self.model.predict(next_state)[0])
-            target_f = self.model.predict(state)
-            target_f[0][action] = target
-            self.model.fit(state, target_f, epochs=1, verbose=0)
+                         self.model.predict(next_state)[0][0]
+            self.model.fit(state, np.array([target]), epochs=1, verbose=0)
         self.set_eps(self.eps*LearningAgent.exploration_decay)
 
 
