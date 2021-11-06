@@ -13,25 +13,6 @@ import keras
 def sigmoid(x, x0, k):
   return 1 / (1 + np.exp(-k*(x-x0)))
 
-class Thankless(object):
-    """Train a neural net on playing NoThanks"""
-    def __init__(self):
-        pass
-    
-    def train(self):
-        # ## Creating the model
-        self.model = Sequential()
-        self.model.add(Dense(16,input_dim=Player.state_size,activation='relu'))
-        # self.model.add(Dense(8,activation='relu'))
-        self.model.add(Dense(1, activation='softmax'))
-        self.model.compile(optimizer='adam',loss='binary_crossentropy')
-
-        self.c = NoThanksController()
-        self.c.play_games(10000, 4)
-        self.x = np.asarray(self.c.all_history)
-        self.y = keras.utils.to_categorical(self.c.winner_history)
-        self.model.fit(x=self.x, y=self.y, epochs=100, batch_size=50)
-
 class NoThanksController(object):
     """Basic controller for playing multiple games of NoThanks"""
     def __init__(self):
@@ -356,8 +337,8 @@ class Human(Player):
         for p in game.players:
             if p is self:
                 continue
-            game.player.cards.sort()
-            print("Player " + str(game.player.position) + "'s cards: " + str(game.player.cards))    
+            p.cards.sort()
+            print("Player " + str(p.position) + "'s cards: " + str(p.cards))    
 
 class Computer(Player):
     """Generic automated player"""
@@ -447,7 +428,7 @@ class HeuristicAgent(RandomAgent):
 
         return self.flip_coin(p)
 
-class HeuristicAgent2(HeuristicAgent):
+class HeuristicAgent2(RandomAgent):
     
     @staticmethod
     def heuristic_prob(state):
@@ -472,93 +453,53 @@ class HeuristicAgent2(HeuristicAgent):
         consensus = np.median([chip_consensus, card_consensus])
 
         return consensus
+
+class QuickHeuristic(HeuristicAgent):
     
-class LearningAgent(Computer):
-    
+    @staticmethod
+    def heuristic_prob(state):
+
+        p = sigmoid(state[2], -1, 0.25)
+        # if state[2] > -5:
+        #     # positive rewards are very rare,
+        #     # and usually the best move is to pass which makes choosing
+        #     # positive rewards even harder, so help select them when learning
+        #     p = 0.5
+        # else:
+        #     # usually a good move to pass
+        #     p = 0.1
+
+        return p
+
+class Thankless(object):
+    """Train a neural net on playing NoThanks"""
+
     gamma              = 0.95
     exploration_rate   = 1.0
     exploration_min    = 0.01
     exploration_decay  = 0.995
     
-    def __init__(self, position):        
-        self.state = SimpleState()
-        self.memory = deque(maxlen=1000)
-        self.set_eps(LearningAgent.exploration_rate)
+    def __init__(self, input_dim = 6):     
+        self.input_shape = (1,input_dim)
+        self.memory = deque(maxlen=2000)
+        self.set_eps(Thankless.exploration_rate)
         self.set_is_training()
         
-        super().__init__(position)
-                
         self.model = Sequential()
         self.model.add(Dense(24, activation='relu',
-                             input_dim=max(self.state.shape)))
+                             input_dim=input_dim))
         self.model.add(Dense(24, activation='relu'))
         self.model.add(Dense(1, activation='sigmoid'))
         self.model.compile(optimizer='adam', loss='mse')
-        
-    def reset(self, position):
-        super().reset(position)
-        if self.is_training:
-            # Learn from the last game(s)
-            self.replay()
-        self.last_action = None
-        self.state.reset()
     
     def set_is_training(self, is_training = True):
         self.is_training = is_training
         
     def set_eps(self, eps):
-        if eps < LearningAgent.exploration_min:
-            self.eps = LearningAgent.exploration_min
+        if eps < Thankless.exploration_min:
+            self.eps = Thankless.exploration_min
         else:
             self.eps = eps
-            
-    def game_over(self, game):
-        if self.is_training and self.last_action is not None:
-            self.remember(copy.deepcopy(self.state.state), 
-                          self.last_action, self.reward, None)
-
-    def choose_action(self, game):
-        
-        if self.is_training:
-            old_state = copy.deepcopy(self.state.state)
-            new_state = copy.deepcopy(self.state.update_state(self, game))
-            
-            if self.last_action is not None:
-                self.remember(old_state, self.last_action, self.reward, new_state)
-        else:
-            self.state.update_state(self, game)
-
-        # Early in training, use a quick heuristic agent
-        if self.is_training and np.random.random() < self.eps:
-            if self.state.state[2] > -2:
-                # positive rewards are very rare,
-                # and usually the best move is to pass which makes choosing
-                # positive rewards even harder, so help select them when learning
-                p = 0.5
-            else:
-                # usually a good move to pass
-                p = 0.2
-        else:
-            p = self.model.predict(self.state.state.reshape(self.state.shape))[0][0]
-        
-        
-        # A uncertainty on our p. As "random" play cools off
-        # start cooling off the uncertainty in our edge probabilities
-        # This might help avoid getting stuck at 0 or 1
-        # Another way to implement exploration
-        if self.eps < 0.5:
-            # never be more than 99% sure of a move
-            min_p = min([0.1*np.exp(-.05/self.eps), 0.01])
-        else:
-            min_p = 0.1
-            
-        max_p = 1 - min_p
-        p_new = np.clip(p, min_p, max_p)
-        return self.flip_coin(p_new)
-    
-    def action(self, game):
-        self.last_action = super().action(game)
-        return self.last_action
     
     def remember(self, state, action, reward, next_state):
         self.memory.append((state, action, reward, next_state))
@@ -568,14 +509,91 @@ class LearningAgent(Computer):
             return
         sample_batch = random.sample(self.memory, sample_batch_size)
         for state, action, reward, next_state in sample_batch:
-            state = state.reshape(self.state.shape)
+            state = state.reshape(self.input_shape)
             target = reward
             if next_state is not None:
-                next_state = next_state.reshape(self.state.shape)
-                target = reward + LearningAgent.gamma * \
+                next_state = next_state.reshape(self.input_shape)
+                target = reward + Thankless.gamma * \
                          self.model.predict(next_state)[0][0]
             self.model.fit(state, np.array([target]), epochs=1, verbose=0)
-        self.set_eps(self.eps*LearningAgent.exploration_decay)
+        self.set_eps(self.eps*Thankless.exploration_decay)
+    
+class LearningAgent(QuickHeuristic):
+    
+    def __init__(self, position, model):        
+        self.state = SimpleState()
+        self.model = model
+
+        super().__init__(position)
+        
+    def reset(self, position):
+        super().reset(position)
+        if self.model.is_training:
+            # Learn from the last game(s)
+            self.model.replay()
+        self.last_action = None
+        self.state.reset()
+    
+    def game_over(self, game):
+        if self.model.is_training and self.last_action is not None and len(self.state.state)>0:
+            self.model.remember(copy.deepcopy(self.state.state), 
+                                self.last_action, self.reward, None)
+
+    def choose_action(self, game):
+        
+        if self.model.is_training:
+            old_state = copy.deepcopy(self.state.state)
+            new_state = copy.deepcopy(self.state.update_state(self, game))
+            
+            # make sure we took an action and even had a state yet
+            # (ex: could be forced to take 3 with 3 chips on it at the start)
+            if self.last_action is not None and len(old_state)>0:
+                self.model.remember(old_state, self.last_action, self.reward, new_state)
+        else:
+            self.state.update_state(self, game)
+
+        # Early in training, use a quick heuristic agent
+        if self.model.is_training and np.random.random() < self.model.eps:
+            p = self.heuristic_prob(self.state.state)
+            # if self.state.state[2] > -5:
+            #     # positive rewards are very rare,
+            #     # and usually the best move is to pass which makes choosing
+            #     # positive rewards even harder, so help select them when learning
+            #     p = 0.5
+            # else:
+            #     # usually a good move to pass
+            #     p = 0.2
+        else:
+            p = self.model.model.predict(self.state.state.reshape(self.state.shape))[0][0]
+        
+        # A uncertainty on our p. As "random" play cools off
+        # start cooling off the uncertainty in our edge probabilities
+        # This might help avoid getting stuck at 0 or 1
+        # Another way to implement exploration
+        # never be more than 95% sure of a move
+        min_p = min([0.2*np.exp(-.05/self.model.eps), 0.05])            
+        max_p = 1 - min_p
+        p_new = np.clip(p, min_p, max_p)
+        return self.flip_coin(p_new)
+    
+    def action(self, game):
+        self.last_action = super().action(game)
+        return self.last_action
+    
+
+    # def train(self):
+    #     # ## Creating the model
+    #     self.model = Sequential()
+    #     self.model.add(Dense(16,input_dim=Player.state_size,activation='relu'))
+    #     # self.model.add(Dense(8,activation='relu'))
+    #     self.model.add(Dense(1, activation='softmax'))
+    #     self.model.compile(optimizer='adam',loss='binary_crossentropy')
+
+    #     self.c = NoThanksController()
+    #     self.c.play_games(10000, 4)
+    #     self.x = np.asarray(self.c.all_history)
+    #     self.y = keras.utils.to_categorical(self.c.winner_history)
+    #     self.model.fit(x=self.x, y=self.y, epochs=100, batch_size=50)
 
 
     # def train(self):
