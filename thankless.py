@@ -1,6 +1,7 @@
 import numpy as np
 import itertools
 from collections import deque 
+from collections import OrderedDict
 import random 
 import copy
 import time
@@ -9,21 +10,32 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import InputLayer, Dense, Activation
 from tensorflow.keras.optimizers import Adam
 import keras
+import matplotlib.pyplot as plt
 
 def sigmoid(x, x0, k):
   return 1 / (1 + np.exp(-k*(x-x0)))
+
+def score_stats(scores):
+    mean_score = np.mean(scores)
+    std_score = np.std(scores)
+    winning_scores = np.max(scores, axis=1)
+    mean_winning_score = np.mean(winning_scores)
+    std_winning_score = np.std(winning_scores)
+
+    print("Mean score: " + str(mean_score) + " Standard deviation: " + str(std_score))
+    print("Mean winning score: " + str(mean_winning_score) + " Standard deviation: " + str(std_winning_score))
+
+def winner_stats(scores):
+    winners = np.argmax(scores, axis=1)
+    pos, wins = np.unique(winners, return_counts=True)
+    windict = dict(zip(pos, 100*wins/len(scores)))
+    print("Win Rate for each player position: " + str(windict))
 
 class NoThanksController(object):
     """Basic controller for playing multiple games of NoThanks"""
     def __init__(self):
         self.all_history = []
         self.winner_history = []
-    #         number_of_computers = number_of_players-number_of_humans
-        
-    # number_of_players, number_of_humans
-    #         # TODO revisit to shuffle players for human/computer mix
-    #     self.players = [Computer(i) for i in range(number_of_computers)] + \
-    #                    [Human(i+number_of_computers) for i in range(number_of_humans)]
     
     def play_games(self, players, number_of_games, silent=True):
         score_history = []
@@ -33,19 +45,6 @@ class NoThanksController(object):
             game.play()
             score_history.append(game.get_scores())
         return score_history
-        
-    def gather_history_one_game(self, game):
-        # just concatenate all histories for each player
-        for p in game.players:
-            if game.winner == p.position:
-                win_or_lose = len(p.history)*[1]
-            else:
-                win_or_lose = len(p.history)*[0]
-                
-            if (p.history):
-                #Its possible for players to have no history
-                self.all_history.extend(p.history)
-                self.winner_history.extend(win_or_lose)
 
 class GameState(object):
     """Generic model that an agent uses for representing the game state"""
@@ -53,18 +52,19 @@ class GameState(object):
 
 class SimpleState(GameState):
     """Simple model that an agent uses for representing the game state"""
-    # number of players, current player chips, chips on card,
-    # value of face up card, min card distance between players cards, and 
-    # min card distance across all players
+    # current player chips, chips on card,
+    # value of face up card, player card reward if taken, 
+    # opponent card reward if taken, min card distance between players cards, 
+    # and min card distance across all players
     
-    shape = (1,6)
-    
+    model_size = 8
+
     def __init__(self):
         self.reset()
         
     def reset(self):
-        self.state = []
-        self.shape = SimpleState.shape
+        self.dict_state = OrderedDict()
+        self.state = np.array(list(self.dict_state))
         self.last_card = np.nan
         
     @staticmethod
@@ -87,29 +87,36 @@ class SimpleState(GameState):
                     min_dist = 0
                 else:
                     min_dist *= -1
-
-            # print(player.position, player.cards, card, min_dist)
-            # abs_dist = np.abs(distance)
-            # mind_dist_ind = np.argmin(abs_dist)
-            
-            # min_dist = distance[mind_dist_ind]
-            # min_abs_dist = abs_dist[mind_dist_ind]
-            
-            # # check if there are two distance == 1 and assign distance = 0
-            # if min_abs_dist == 1:
-            #     if np.count_nonzero(abs_dist == min_dist) == 2:
-            #         min_dist = 0
         else:
-            min_dist = card
+            min_dist = np.inf
         
         return min_dist
+    
+    @staticmethod
+    def card_reward(card, chips, dist):
+        reward = chips - card
+        if dist == 0:
+            # connecting runs, reward is reducing score by game.card+1 (+chips)
+            reward += 2*card+1 # add back game.card we subtracted
+        elif dist == -1:
+            # extra reward +1 because smaller end of a run
+            reward += card+1 
+        elif dist == 1:
+            # add back game.card we subtracted
+            reward += card
+        return reward
         
     def update_state(self, player, game):
         if self.last_card == game.card:
-            # only thing that could have changed is player.chips and game.chips
-            self.state[0] -= 1 
-            self.state[1] += game.number_of_players
-            self.state[2] += game.number_of_players
+            # went around passing
+            self.dict_state['player_chips'] -= 1
+            self.dict_state['game_chips'] += game.number_of_players
+            self.dict_state['p_reward'] += game.number_of_players
+            self.dict_state['o_reward'] += game.number_of_players
+            if self.inf_p_min_dist:
+                self.dict_state['p_dist'] -= game.number_of_players
+            if self.inf_o_min_dist:
+                self.dict_state['o_dist'] -= game.number_of_players                
         else:
             # Only update distances if we haven't yet for this new card
             self.last_card = game.card
@@ -119,23 +126,50 @@ class SimpleState(GameState):
             
             # minimum min_distance of all other players        
             o_dists = [SimpleState.min_distance(p, game.card)
-                      for p in game.players if p is not player]
-            # this breaks ties negative
-            o_min_dist = min(o_dists, key=abs)
+                       for p in game.players if p is not player]
 
-            card_reward = game.chips - game.card
-            if p_min_dist == 0:
-                # connecting runs, reward is reducing score by game.card+1 (+chips)
-                card_reward += 2*game.card+1 # add back game.card we subtracted
-            elif p_min_dist == -1:
-                # extra reward +1 because smaller end of a run
-                card_reward += game.card+1 
-            elif p_min_dist == 1:
-                # add back game.card we subtracted
-                card_reward += game.card 
+            # this breaks ties negative
+            o_min_dist = min(np.sort(o_dists), key=abs)
+            
+            # calculate rewards if cards were taken
+            p_card_reward = self.card_reward(game.card, game.chips, p_min_dist)
+            o_card_reward = self.card_reward(game.card, game.chips, o_min_dist)
+
+            # if p_min_dist or o_min_dist are inf, no cards yet, so assign
+            # this distance is the negative of the card_reward
+            # this might incentivize taking cards earlier in the game with
+            # many chips. These "distances" will be positive but decreasing.
+            # When they hit 0, game force takes so no worrying about wrapping
+            # to negative distances
+            if np.isinf(p_min_dist):
+                self.inf_p_min_dist = True
+                p_min_dist = -1*p_card_reward
+            else:
+                self.inf_p_min_dist = False
+            if np.isinf(o_min_dist):
+                self.inf_o_min_dist = True
+                o_min_dist = -1*(o_card_reward+1) # plus one chip for next player
+            else:
+                self.inf_o_min_dist = False
+                # modify o_card_reward by the number of chips that will be added
+                # if the card gets to that player
+                o_positions = [p.position for p in game.players if p is not player]
+                # find player position of this minimum
+                o_min_dist_position = o_positions[o_dists.index(o_min_dist)]
+                o_card_reward += (o_min_dist_position - player.position) % game.number_of_players
                 
-            self.state=np.array([player.chips, game.chips, card_reward,
-                                 game.card, p_min_dist, o_min_dist])
+            self.dict_state['deck_size'] = game.deck_size
+            self.dict_state['player_chips'] = player.chips
+            self.dict_state['game_chips'] = game.chips
+            self.dict_state['game_card'] = game.card
+            self.dict_state['p_reward'] = p_card_reward
+            self.dict_state['o_reward'] = o_card_reward
+            self.dict_state['p_dist'] = p_min_dist
+            self.dict_state['o_dist'] = o_min_dist
+        
+        # for model learning
+        self.state = np.array(list(self.dict_state.values()))
+        # print(player.position, self.state)
         return self.state
         
 class FullState(GameState):
@@ -314,17 +348,20 @@ class Player(object):
 class Human(Player):
     """Human player via terminal input"""
     def choose_action(self, game):
-        print("=====================================")
+        print("=======================================")
         print("Card: " + str(game.card) + " | Chips: " + str(game.chips) + 
               " | # Cards Left: " + str(game.deck_size))
-        print("=====================================")
+        print("=======================================")
         self.cards.sort()
-        print("My Cards: " + str(self.cards) + " My Chips: " + str(self.chips))
+        str_cards = [str(c) for c in self.cards]
+        
+        print("My Cards: " + ', '.join(str_cards) + " | My Chips: " + str(self.chips))
         
         # wrap around all players back to ourself to print out their cards
         while game.next_player() is not self:
             game.player.cards.sort()
-            print("Player " + str(game.player.position) + "'s cards: " + str(game.player.cards))    
+            str_cards = [str(c) for c in game.player.cards]
+            print("Player " + str(game.player.position+1) + "'s cards: " + ', '.join(str_cards))    
         
         return int(input("0 = Pass, 1 = Take Card: "))
     
@@ -371,30 +408,23 @@ class HeuristicAgent(RandomAgent):
         self.state.reset()
         
     @staticmethod
-    def prob_state(x, state_index):
+    def prob_state(x, state_key):
         """Probability of taking the card based on the state variable"""
-        # [player.chips, game.chips, game.card, take_reward, p_dist, o_dist])
-        
-        if np.isnan(x):
-            return x
-        
-        # player chips
-        if state_index == 0:
+        if state_key == 'deck_size':
+            return sigmoid(x, (NoThanks.full_deck_size-NoThanks.cards_removed)/2, .5)
+        elif state_key == 'player_chips':
             return 1-sigmoid(x, 6, .6)
-        # card chips
-        elif state_index == 1:
+        elif state_key == 'game_chips':
             # return sigmoid(x, 10, 0.6)
             return sigmoid(x, 8, 0.75) # need to pick up cards earlier
-        # reward for taking card
-        elif state_index == 2:
+        elif state_key == 'game_card':
+            return 1-sigmoid(x, 18, 0.25)
+        elif state_key == 'p_reward' or state_key == 'o_reward':
             # its ok to take small negative rewards?
             # return sigmoid(x, -3, 1)
             return sigmoid(x, -5, 1) # need to pick up card earlier
-        # card value
-        elif state_index == 3:
-            return 1-sigmoid(x, 18, 0.25)
         # player/opponent distance
-        elif state_index > 3:
+        elif state_key == 'p_dist' or state_key == 'o_dist':
             return 1-2*np.abs(sigmoid(x, 0, 0.5)-0.5)
             # 1-sigmoid(np.abs(x), 2, 2)
         
@@ -404,8 +434,8 @@ class HeuristicAgent(RandomAgent):
         """Return 0, p, or 1 based on consensus of coin flips for 
         various state variables"""
         
-        parray = np.array([HeuristicAgent.prob_state(value, i) 
-                           for i, value in enumerate(state)])
+        parray = np.array([HeuristicAgent.prob_state(value, state_key) 
+                           for state_key, value in state.items()])
         
         # Flip a biased coin for each probability associated with each
         # state variable
@@ -424,50 +454,28 @@ class HeuristicAgent(RandomAgent):
         # with each coin being a function of the state variable
         self.state.update_state(self, game)
 
-        p = self.heuristic_prob(self.state.state)
+        p = self.heuristic_prob(self.state.dict_state)
 
         return self.flip_coin(p)
-
-class HeuristicAgent2(RandomAgent):
-    
-    @staticmethod
-    def heuristic_prob(state):
-        """Return 0, p, or 1 based on consensus of coin flips for 
-        various state variables"""
-        
-        parray = np.array([HeuristicAgent.prob_state(value, i) 
-                           for i, value in enumerate(state)])
-
-        # split into chip state consensus and card state consensus
-        chip_ps = parray[0:3]
-        chip_flips = np.random.binomial(1, chip_ps)
-        chip_consensus = np.median(chip_flips)
-        
-        # this may contain nans
-        card_ps = parray[3:]
-        card_ps = card_ps[~np.isnan(card_ps)]
-        card_flips = np.random.binomial(1, card_ps)
-        card_consensus = np.median(card_flips)
-        
-        # This could be 0,0.25,0.5,0.75,1 which is ok?
-        consensus = np.median([chip_consensus, card_consensus])
-
-        return consensus
 
 class QuickHeuristic(HeuristicAgent):
     
     @staticmethod
     def heuristic_prob(state):
+        # positive rewards are very rare,
+        # and usually the best move is to pass which makes choosing
+        # positive rewards even harder.
 
-        p = sigmoid(state[2], -1, 0.25)
-        # if state[2] > -5:
-        #     # positive rewards are very rare,
-        #     # and usually the best move is to pass which makes choosing
-        #     # positive rewards even harder, so help select them when learning
-        #     p = 0.5
-        # else:
-        #     # usually a good move to pass
-        #     p = 0.1
+        # if our p_dist is not neighboring, consider taking negative
+        # total rewards becaues they give chips
+        # but if our p_dist is neighboring, try to hold out for more points
+        if abs(state['p_dist'])<=1:
+            p = sigmoid(state['p_reward'], 5, 0.5)    
+        else:
+            if state['player_chips'] >= 15:
+                p = sigmoid(state['p_reward'], -3, 1.25)
+            else:
+                p = sigmoid(state['p_reward'], -6, 0.7)
 
         return p
 
@@ -479,16 +487,16 @@ class Thankless(object):
     exploration_min    = 0.01
     exploration_decay  = 0.995
     
-    def __init__(self, input_dim = 6):     
+    def __init__(self, input_dim = SimpleState.model_size):     
         self.input_shape = (1,input_dim)
-        self.memory = deque(maxlen=2000)
+        self.memory = deque(maxlen=3000)
         self.set_eps(Thankless.exploration_rate)
         self.set_is_training()
         
         self.model = Sequential()
-        self.model.add(Dense(24, activation='relu',
+        self.model.add(Dense(36, activation='relu',
                              input_dim=input_dim))
-        self.model.add(Dense(24, activation='relu'))
+        self.model.add(Dense(36, activation='relu'))
         self.model.add(Dense(1, activation='sigmoid'))
         self.model.compile(optimizer='adam', loss='mse')
     
@@ -554,25 +562,19 @@ class LearningAgent(QuickHeuristic):
 
         # Early in training, use a quick heuristic agent
         if self.model.is_training and np.random.random() < self.model.eps:
-            p = self.heuristic_prob(self.state.state)
-            # if self.state.state[2] > -5:
-            #     # positive rewards are very rare,
-            #     # and usually the best move is to pass which makes choosing
-            #     # positive rewards even harder, so help select them when learning
-            #     p = 0.5
-            # else:
-            #     # usually a good move to pass
-            #     p = 0.2
+            p = self.heuristic_prob(self.state.dict_state)
         else:
-            p = self.model.model.predict(self.state.state.reshape(self.state.shape))[0][0]
+            p = self.model.model.predict(self.state.state.reshape(self.model.input_shape))[0][0]
         
         # A uncertainty on our p. As "random" play cools off
         # start cooling off the uncertainty in our edge probabilities
         # This might help avoid getting stuck at 0 or 1
         # Another way to implement exploration
-        # never be more than 95% sure of a move
-        min_p = min([0.2*np.exp(-.05/self.model.eps), 0.05])            
-        max_p = 1 - min_p
+        # never be more than 98% sure of taking a card
+        # and 99% for passing a card
+        uncertainty = 0.2*np.exp(-.05/self.model.eps)
+        min_p = min([uncertainty, Thankless.exploration_min])            
+        max_p = 1 - min([uncertainty, 2*Thankless.exploration_min])            
         p_new = np.clip(p, min_p, max_p)
         return self.flip_coin(p_new)
     
