@@ -283,8 +283,26 @@ class NoThanks(object):
                 self.next_player()
 
     def get_scores(self):
-        return [s.score for s in self.players]     
-        
+        return [s.score for s in self.players]
+
+    def print_players(self, current=True):
+        for p in self.players:
+            p.cards.sort()
+            str_cards = [str(c) for c in p.cards]
+            if current and p is self.player:
+                print("    My     Chips: " + str(self.player.chips) + 
+                      " | Cards: " + ', '.join(str_cards))
+            else:
+                print("Player " + str(p.position+1) + "'s Chips: "
+                  + str(p.chips) + " | Cards: " + ', '.join(str_cards)) 
+                
+    def print_game_state(self):
+        print("=======================================")
+        print("Card: " + str(self.card) + " | Chips: " + str(self.chips) + 
+              " | # Cards Left: " + str(self.deck_size))
+        print("=======================================")
+        self.print_players()
+
 
 class Player(object):
     """Basic functionality of a NoThanks player"""    
@@ -310,7 +328,6 @@ class Player(object):
         old_score = self.score
         self.chips += game.chips
         self.cards.append(game.card)
-        # self.cards.sort()
         
         return self.calculate_score()-old_score
     
@@ -347,35 +364,14 @@ class Player(object):
         
 class Human(Player):
     """Human player via terminal input"""
+
     def choose_action(self, game):
-        print("=======================================")
-        print("Card: " + str(game.card) + " | Chips: " + str(game.chips) + 
-              " | # Cards Left: " + str(game.deck_size))
-        print("=======================================")
-        self.cards.sort()
-        str_cards = [str(c) for c in self.cards]
-        
-        print("My Cards: " + ', '.join(str_cards) + " | My Chips: " + str(self.chips))
-        
-        # wrap around all players back to ourself to print out their cards
-        while game.next_player() is not self:
-            game.player.cards.sort()
-            str_cards = [str(c) for c in game.player.cards]
-            print("Player " + str(game.player.position+1) + "'s cards: " + ', '.join(str_cards))    
-        
+        game.print_game_state()       
         return int(input("0 = Pass, 1 = Take Card: "))
     
     def game_over(self, game):
         print("===============FINAL STATE===================")
-        self.cards.sort()
-        print("My Cards: " + str(self.cards) + " My Chips: " + str(self.chips))
-        
-        # wrap around all players back to ourself to print out their cards
-        for p in game.players:
-            if p is self:
-                continue
-            p.cards.sort()
-            print("Player " + str(p.position) + "'s cards: " + str(p.cards))    
+        game.print_players(current=False)
 
 class Computer(Player):
     """Generic automated player"""
@@ -540,23 +536,46 @@ class LearningAgent(QuickHeuristic):
             # Learn from the last game(s)
             self.model.replay()
         self.last_action = None
+        self.passes = 0
         self.state.reset()
     
     def game_over(self, game):
         if self.model.is_training and self.last_action is not None and len(self.state.state)>0:
+            reward = self.reward_shaping(game)
             self.model.remember(copy.deepcopy(self.state.state), 
-                                self.last_action, self.reward, None)
+                                self.last_action, reward, None)
 
+    def reward_shaping(self, game):
+        if self.last_action:
+            # if we take, the reward is just the normal reward
+            # reset times passed on this card if we took a card
+            self.passes = 0
+            return self.reward
+        else:
+            # -n chips we passed on a card if it is taken by someone else
+            #   this should disincentivize passing too much
+            # +(N-1) (number of players) if we passed but it comes back around
+            #   this should incentivize passing when we don't think others will take
+            if self.state.last_card == game.card:
+                new_reward = game.number_of_players
+                self.passes += 1 # we previously passed
+            else:
+                new_reward = -1*self.passes
+                self.passes = 0
+            return new_reward
+        
+        
     def choose_action(self, game):
         
         if self.model.is_training:
             old_state = copy.deepcopy(self.state.state)
+            reward = self.reward_shaping(game)
             new_state = copy.deepcopy(self.state.update_state(self, game))
             
             # make sure we took an action and even had a state yet
             # (ex: could be forced to take 3 with 3 chips on it at the start)
             if self.last_action is not None and len(old_state)>0:
-                self.model.remember(old_state, self.last_action, self.reward, new_state)
+                self.model.remember(old_state, self.last_action, reward, new_state)
         else:
             self.state.update_state(self, game)
 
@@ -581,31 +600,6 @@ class LearningAgent(QuickHeuristic):
     def action(self, game):
         self.last_action = super().action(game)
         return self.last_action
-    
-
-    # def train(self):
-    #     # ## Creating the model
-    #     self.model = Sequential()
-    #     self.model.add(Dense(16,input_dim=Player.state_size,activation='relu'))
-    #     # self.model.add(Dense(8,activation='relu'))
-    #     self.model.add(Dense(1, activation='softmax'))
-    #     self.model.compile(optimizer='adam',loss='binary_crossentropy')
-
-    #     self.c = NoThanksController()
-    #     self.c.play_games(10000, 4)
-    #     self.x = np.asarray(self.c.all_history)
-    #     self.y = keras.utils.to_categorical(self.c.winner_history)
-    #     self.model.fit(x=self.x, y=self.y, epochs=100, batch_size=50)
-
-
-    # def train(self):
-    #     states = np.asarray(self.states)
-    #     state_len = len(states)
-    #     target_vectors = np.zeros((state_len, 2))
-    #     for i in range(state_len):
-    #         target_vectors[i][self.actions[i]] = self.rewards[i]
-        
-    #     self.model.fit(x=states, y=target_vectors, epochs = 5)
 
 def main():
     pass
