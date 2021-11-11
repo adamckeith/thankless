@@ -65,7 +65,7 @@ class SimpleState(GameState):
     def reset(self):
         self.dict_state = OrderedDict()
         self.state = np.array(list(self.dict_state))
-        self.last_card = np.nan
+        self.last_card = None
         
     @staticmethod
     def min_distance(player, card):
@@ -107,6 +107,10 @@ class SimpleState(GameState):
         return reward
         
     def update_state(self, player, game):
+        """This is only called before choosing an action,
+        only if that is possible. If the agent is forced to take a card, then 
+        the state is not updated because that is irrelevant for making choices"""
+        
         if self.last_card == game.card:
             # went around passing
             self.dict_state['player_chips'] -= 1
@@ -316,6 +320,8 @@ class Player(object):
         self.cards = []
         self.score = self.chips  
         self.reward = 0
+        self.last_card = None # the last card that this player has seen
+        self.forced_take = False
         
     def pass_turn(self):
         """1 = Pass turn by placing a chip on the card. Returns reward = -1"""
@@ -340,19 +346,23 @@ class Player(object):
         
     def action(self, game):
         """Game asks player to act. Returns 1 if card is taken, 0 if passed"""
-        
+
         # Must take if no chips or if chips on card equals card value 
         # (why wouldn't you?)
         if self.chips<=0 or game.chips>=game.card:
+            self.forced_take = True
             self.reward = self.take_card(game)
             a = 1
         else:
+            self.forced_take = False
             a = self.choose_action(game)
             if a:
                 self.reward = self.take_card(game)
             else:
                 self.reward = self.pass_turn()
-        # self.reward += 1 # try making everything positive
+
+        # Update the last card that we have seen
+        self.last_card = game.card        
         return a
         
     def calculate_score(self):
@@ -482,10 +492,11 @@ class Thankless(object):
     exploration_rate   = 1.0
     exploration_min    = 0.01
     exploration_decay  = 0.995
+    mem_length         = 4000
     
     def __init__(self, input_dim = SimpleState.model_size):     
         self.input_shape = (1,input_dim)
-        self.memory = deque(maxlen=3000)
+        self.memory = deque(maxlen=Thankless.mem_length)
         self.set_eps(Thankless.exploration_rate)
         self.set_is_training()
         
@@ -546,27 +557,53 @@ class LearningAgent(QuickHeuristic):
                                 self.last_action, reward, None)
 
     def reward_shaping(self, game):
-        if self.last_action:
+        # all of this bypasses taking a card when forced
+        # because we never choose an action
+        
+        if self.forced_take:
+            # if the last action was forced to take a card, overwrite the last
+            # action as passing (with 1 chip)
+            self.last_action = 0
+            # self.state.last_card is the last card we made a decision on
+            # self.last_card is actually the card we forced took
+            
+            if self.state.last_card == self.last_card:
+                # if they are the same we just the reward for taking the card
+                return self.reward
+            else:
+                # if they are different, than the state.last_card was taken
+                # by another player, so we lose those chips and also take the 
+                # reward for taking the card
+                return self.reward - self.passes
+            self.passes = 0
+            
+        elif self.last_action:
             # if we take, the reward is just the normal reward
             # reset times passed on this card if we took a card
             self.passes = 0
             return self.reward
         else:
-            # -n chips we passed on a card if it is taken by someone else
-            #   this should disincentivize passing too much
+            self.passes += 1 # we previously passed
             # +(N-1) (number of players) if we passed but it comes back around
             #   this should incentivize passing when we don't think others will take
             if self.state.last_card == game.card:
-                new_reward = game.number_of_players
-                self.passes += 1 # we previously passed
+                new_reward = (game.number_of_players-1)
             else:
+                # -n chips we passed on a card if it is taken by someone else
+                # and since we give those chips to another player, it should be even worse
+                # let's just pretend we distributed our chips to all other players
+                # 1/(N-1)
+                #   this should disincentivize passing too much
+                # new_reward = -(1+1/(game.number_of_players-1))*self.passes
+                # new_reward = -2*self.passes
                 new_reward = -1*self.passes
                 self.passes = 0
             return new_reward
         
         
     def choose_action(self, game):
-        
+        """This is only called if we did not force take a card"""
+        # Thus, self.state is only updated if we had a choice in action
         if self.model.is_training:
             old_state = copy.deepcopy(self.state.state)
             reward = self.reward_shaping(game)
