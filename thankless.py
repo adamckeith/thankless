@@ -57,7 +57,7 @@ class SimpleState(GameState):
     # opponent card reward if taken, min card distance between players cards, 
     # and min card distance across all players
     
-    model_size = 8
+    model_size = 9
 
     def __init__(self):
         self.reset()
@@ -120,7 +120,8 @@ class SimpleState(GameState):
             if self.inf_p_min_dist:
                 self.dict_state['p_dist'] -= game.number_of_players
             if self.inf_o_min_dist:
-                self.dict_state['o_dist'] -= game.number_of_players                
+                self.dict_state['o_dist'] -= game.number_of_players     
+            self.dict_state['o_chips'] -= 1
         else:
             # Only update distances if we haven't yet for this new card
             self.last_card = game.card
@@ -131,6 +132,8 @@ class SimpleState(GameState):
             # minimum min_distance of all other players        
             o_dists = [SimpleState.min_distance(p, game.card)
                        for p in game.players if p is not player]
+            o_chips = [p.chips for p in game.players if p is not player]
+            o_chips = min(o_chips)
 
             # this breaks ties negative
             o_min_dist = min(np.sort(o_dists), key=abs)
@@ -170,6 +173,7 @@ class SimpleState(GameState):
             self.dict_state['o_reward'] = o_card_reward
             self.dict_state['p_dist'] = p_min_dist
             self.dict_state['o_dist'] = o_min_dist
+            self.dict_state['o_chips'] = o_chips
         
         # for model learning
         self.state = np.array(list(self.dict_state.values()))
@@ -475,13 +479,54 @@ class QuickHeuristic(HeuristicAgent):
         # if our p_dist is not neighboring, consider taking negative
         # total rewards becaues they give chips
         # but if our p_dist is neighboring, try to hold out for more points
+        
+        # if a card has this many chips, consider a coin flip for taking it
+        target_chips = np.floor(state['game_card']/2)
+        
+        if state['p_reward']>=0:
+            if state['o_reward']>=0:
+                # someone will surely take, so take before them
+                p = 1
+            elif state['o_chips']==0:
+                # someone has to take but they will lose a lot so it might
+                # be worth forcing them if their reward is 
+                # (this o_reward might not correspond to o_chips==0 but 
+                # close enough)
+                if -1*state['o_reward'] > 3*state['p_reward']:
+                    p = 0
+                else:
+                    p = 1
+            else:
+                # try to get more chips
+                p = sigmoid(state['game_chips'], target_chips, 1)    
+        else:
+            if state['player_chips'] >= 11:
+                p = sigmoid(state['p_reward'], -3, 1)
+            else:
+                p = sigmoid(state['game_chips'], target_chips, 1)    
+
+        return p
+    
+class AdvantageHeuristic(HeuristicAgent):
+    """Designed to take advantage of learning agents"""
+    
+    @staticmethod
+    def heuristic_prob(state):
+        # positive rewards are very rare,
+        # and usually the best move is to pass which makes choosing
+        # positive rewards even harder.
+
+        # if our p_dist is not neighboring, consider taking negative
+        # total rewards becaues they give chips
+        # but if our p_dist is neighboring, try to hold out for more points
         if abs(state['p_dist'])<=1:
             p = sigmoid(state['p_reward'], 5, 0.5)    
+        elif state['game_card'] > 5 and state['p_reward'] > -5:
+            p = 1
+        elif state['p_reward'] > -3:
+            p = 1
         else:
-            if state['player_chips'] >= 15:
-                p = sigmoid(state['p_reward'], -3, 1.25)
-            else:
-                p = sigmoid(state['p_reward'], -6, 0.7)
+            p = 0 
 
         return p
 
@@ -491,7 +536,7 @@ class Thankless(object):
     gamma              = 0.95
     exploration_rate   = 1.0
     exploration_min    = 0.01
-    exploration_decay  = 0.995
+    exploration_decay  = 0.997
     mem_length         = 4000
     
     def __init__(self, input_dim = SimpleState.model_size):     
@@ -501,9 +546,12 @@ class Thankless(object):
         self.set_is_training()
         
         self.model = Sequential()
-        self.model.add(Dense(36, activation='relu',
+        self.model.add(Dense(36, activation='tanh',
                              input_dim=input_dim))
-        self.model.add(Dense(36, activation='relu'))
+        self.model.add(Dense(36, activation='tanh'))
+        # self.model.add(Dense(36, activation='relu',
+        #                      input_dim=input_dim))
+        # self.model.add(Dense(36, activation='relu'))
         self.model.add(Dense(1, activation='sigmoid'))
         self.model.compile(optimizer='adam', loss='mse')
     
@@ -522,6 +570,25 @@ class Thankless(object):
     def replay(self, sample_batch_size=32):
         if len(self.memory) < sample_batch_size:
             return
+        
+        # build probabilities for selecting a sample batch based
+        # on sparse large rewards
+        # if np.random.random() < (1-self.eps):
+        #     rwds = [self.memory[i][2] for i in range(len(self.memory))]
+        #     rwds = np.abs(rwds)
+  
+        #     # p = np.ones(len(self.memory))/len(self.memory)
+        #     # p[np.where(rwds>5)] *= 50
+        #     # p = p/np.sum(p)
+        #     p = Thankless.mem_length*[1/Thankless.mem_length]
+        #     p = rwds/np.sum(rwds)
+        #     p = np.clip(p, 1e-4, 1)
+        #     p = p/np.sum(p)
+        
+        #     sample_batch = np.random.choice(range(len(self.memory)), sample_batch_size, p=p)
+        #     sample_batch = [self.memory[i] for i in range(sample_batch_size)]
+        # else:
+        #     sample_batch = random.sample(self.memory, sample_batch_size)
         sample_batch = random.sample(self.memory, sample_batch_size)
         for state, action, reward, next_state in sample_batch:
             state = state.reshape(self.input_shape)
@@ -533,7 +600,7 @@ class Thankless(object):
             self.model.fit(state, np.array([target]), epochs=1, verbose=0)
         self.set_eps(self.eps*Thankless.exploration_decay)
     
-class LearningAgent(QuickHeuristic):
+class LearningAgent(HeuristicAgent):
     
     def __init__(self, position, model):        
         self.state = SimpleState()
@@ -574,7 +641,7 @@ class LearningAgent(QuickHeuristic):
                 # if they are different, than the state.last_card was taken
                 # by another player, so we lose those chips and also take the 
                 # reward for taking the card
-                return self.reward - self.passes
+                return self.reward - (1+1/(game.number_of_players-1))*self.passes
             self.passes = 0
             
         elif self.last_action:
@@ -594,9 +661,9 @@ class LearningAgent(QuickHeuristic):
                 # let's just pretend we distributed our chips to all other players
                 # 1/(N-1)
                 #   this should disincentivize passing too much
-                # new_reward = -(1+1/(game.number_of_players-1))*self.passes
+                new_reward = -(1+1/(game.number_of_players-1))*self.passes
                 # new_reward = -2*self.passes
-                new_reward = -1*self.passes
+                #new_reward = -1*self.passes
                 self.passes = 0
             return new_reward
         
@@ -618,7 +685,11 @@ class LearningAgent(QuickHeuristic):
 
         # Early in training, use a quick heuristic agent
         if self.model.is_training and np.random.random() < self.model.eps:
-            p = self.heuristic_prob(self.state.dict_state)
+            p = QuickHeuristic.heuristic_prob(self.state.dict_state)
+            # if self.model.eps > .65:
+            #     p = QuickHeuristic.heuristic_prob(self.state.dict_state)
+            # else:
+            #     p = AdvantageHeuristic.heuristic_prob(self.state.dict_state)
         else:
             p = self.model.model.predict(self.state.state.reshape(self.model.input_shape))[0][0]
         
