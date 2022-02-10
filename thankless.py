@@ -623,7 +623,53 @@ class LearningAgent(HeuristicAgent):
             self.model.remember(copy.deepcopy(self.state.state), 
                                 self.last_action, reward, None)
 
+    @staticmethod
+    def multiplayer_corection(number_of_players, passes):
+        return (1+1/(number_of_players-1))*passes
+    
     def reward_shaping(self, game):
+        # all of this bypasses taking a card when forced
+        # because we never choose an action
+        
+        if self.forced_take:
+            # if the last action was forced to take a card, overwrite the last
+            # action as passing (with 1 chip)
+            self.last_action = 0
+            # self.state.last_card is the last card we made a decision on
+            # self.last_card is actually the card we forced took
+            
+            if self.state.last_card == self.last_card:
+                # if they are the same we just the reward for taking the card
+                return self.reward
+            else:
+                # if they are different, than the state.last_card was taken
+                # by another player, so we lose those chips and also take the 
+                # reward for taking the card
+                return self.reward - 1
+            self.passes = 0
+            
+        elif self.last_action:
+            # if we take, the reward is just the normal reward
+            # reset times passed on this card if we took a card
+            self.passes = 0
+            return self.reward
+        else:
+            self.passes += 1 # we previously passed
+            # +(N-1) (number of players) if we passed but it comes back around
+            #   this should incentivize passing when we don't think others will take
+            if self.state.last_card == game.card:
+                new_reward = -1
+            else:
+                # -n chips we passed on a card if it is taken by someone else
+                # and since we give those chips to another player, it should be even worse
+                # let's just pretend we distributed our chips to all other players
+                # 1/(N-1)
+                #   this should disincentivize passing too much
+                new_reward = -1
+                self.passes = 0
+            return new_reward
+
+    def reward_shaping2(self, game):
         # all of this bypasses taking a card when forced
         # because we never choose an action
         
